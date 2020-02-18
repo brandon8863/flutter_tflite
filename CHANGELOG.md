@@ -1,3 +1,17 @@
+## 1.0.4
+
+* Add PoseNet support
+
+## 1.0.3
+
+* Add an asynch option to offload the TfLite run from the UI thread
+* Add Deeplab support
+
+## 1.0.2
+
+* Add pix2pix support
+* Make number of detections dynamic in Android
+
 ## 1.0.1
 
 * Add detectObjectOnBinary

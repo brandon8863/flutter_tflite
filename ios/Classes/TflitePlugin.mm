@@ -1,3 +1,5 @@
+//#define CONTRIB_PATH
+
 #import "TflitePlugin.h"
 
 #include <pthread.h>
@@ -8,22 +10,40 @@
 #include <sstream>
 #include <string>
 
+#ifdef CONTRIB_PATH
+#include "tensorflow/contrib/lite/kernels/register.h"
+#include "tensorflow/contrib/lite/model.h"
+#include "tensorflow/contrib/lite/string_util.h"
+#include "tensorflow/contrib/lite/op_resolver.h"
+#else
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
 #include "tensorflow/lite/string_util.h"
 #include "tensorflow/lite/op_resolver.h"
+#endif
 
 #include "ios_image_load.h"
 
 #define LOG(x) std::cerr
 
+typedef void (^TfLiteStatusCallback)(TfLiteStatus);
 NSString* loadModel(NSObject<FlutterPluginRegistrar>* _registrar, NSDictionary* args);
-NSMutableArray* runModelOnImage(NSDictionary* args);
-NSMutableArray* runModelOnBinary(NSDictionary* args);
-NSMutableArray* runModelOnFrame(NSDictionary* args);
-NSMutableArray* detectObjectOnImage(NSDictionary* args);
-NSMutableArray* detectObjectOnBinary(NSDictionary* args);
-NSMutableArray* detectObjectOnFrame(NSDictionary* args);
+void runTflite(NSDictionary* args, TfLiteStatusCallback cb);
+void runModelOnImage(NSDictionary* args, FlutterResult result);
+void runModelOnBinary(NSDictionary* args, FlutterResult result);
+void runModelOnFrame(NSDictionary* args, FlutterResult result);
+void detectObjectOnImage(NSDictionary* args, FlutterResult result);
+void detectObjectOnBinary(NSDictionary* args, FlutterResult result);
+void detectObjectOnFrame(NSDictionary* args, FlutterResult result);
+void runPix2PixOnImage(NSDictionary* args, FlutterResult result);
+void runPix2PixOnBinary(NSDictionary* args, FlutterResult result);
+void runPix2PixOnFrame(NSDictionary* args, FlutterResult result);
+void runSegmentationOnImage(NSDictionary* args, FlutterResult result);
+void runSegmentationOnBinary(NSDictionary* args, FlutterResult result);
+void runSegmentationOnFrame(NSDictionary* args, FlutterResult result);
+void runPoseNetOnImage(NSDictionary* args, FlutterResult result);
+void runPoseNetOnBinary(NSDictionary* args, FlutterResult result);
+void runPoseNetOnFrame(NSDictionary* args, FlutterResult result);
 void close();
 
 @implementation TflitePlugin {
@@ -51,23 +71,35 @@ void close();
     NSString* load_result = loadModel(_registrar, call.arguments);
     result(load_result);
   } else if ([@"runModelOnImage" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = runModelOnImage(call.arguments);
-    result(inference_result);
+    runModelOnImage(call.arguments, result);
   } else if ([@"runModelOnBinary" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = runModelOnBinary(call.arguments);
-    result(inference_result);
+    runModelOnBinary(call.arguments, result);
   } else if ([@"runModelOnFrame" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = runModelOnFrame(call.arguments);
-    result(inference_result);
+    runModelOnFrame(call.arguments, result);
   } else if ([@"detectObjectOnImage" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = detectObjectOnImage(call.arguments);
-    result(inference_result);
+    detectObjectOnImage(call.arguments, result);
   } else if ([@"detectObjectOnBinary" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = detectObjectOnBinary(call.arguments);
-    result(inference_result);
+    detectObjectOnBinary(call.arguments, result);
   } else if ([@"detectObjectOnFrame" isEqualToString:call.method]) {
-    NSMutableArray* inference_result = detectObjectOnFrame(call.arguments);
-    result(inference_result);
+    detectObjectOnFrame(call.arguments, result);
+  } else if ([@"runPix2PixOnImage" isEqualToString:call.method]) {
+    runPix2PixOnImage(call.arguments, result);
+  } else if ([@"runPix2PixOnBinary" isEqualToString:call.method]) {
+    runPix2PixOnBinary(call.arguments, result);
+  } else if ([@"runPix2PixOnFrame" isEqualToString:call.method]) {
+    runPix2PixOnFrame(call.arguments, result);
+  } else if ([@"runSegmentationOnImage" isEqualToString:call.method]) {
+    runSegmentationOnImage(call.arguments, result);
+  } else if ([@"runSegmentationOnBinary" isEqualToString:call.method]) {
+    runSegmentationOnBinary(call.arguments, result);
+  } else if ([@"runSegmentationOnFrame" isEqualToString:call.method]) {
+    runSegmentationOnFrame(call.arguments, result);
+  } else if ([@"runPoseNetOnImage" isEqualToString:call.method]) {
+    runPoseNetOnImage(call.arguments, result);
+  } else if ([@"runPoseNetOnBinary" isEqualToString:call.method]) {
+    runPoseNetOnBinary(call.arguments, result);
+  } else if ([@"runPoseNetOnFrame" isEqualToString:call.method]) {
+    runPoseNetOnFrame(call.arguments, result);
   } else if ([@"close" isEqualToString:call.method]) {
     close();
   } else {
@@ -80,6 +112,7 @@ void close();
 std::vector<std::string> labels;
 std::unique_ptr<tflite::FlatBufferModel> model;
 std::unique_ptr<tflite::Interpreter> interpreter;
+bool interpreter_busy = false;
 
 static void LoadLabels(NSString* labels_path,
                        std::vector<std::string>* label_strings) {
@@ -88,9 +121,8 @@ static void LoadLabels(NSString* labels_path,
   }
   std::ifstream t;
   t.open([labels_path UTF8String]);
-  std::string line;
-  while (t) {
-    std::getline(t, line);
+  label_strings->clear();
+  for (std::string line; std::getline(t, line); ) {
     label_strings->push_back(line);
   }
   t.close();
@@ -109,9 +141,11 @@ NSString* loadModel(NSObject<FlutterPluginRegistrar>* _registrar, NSDictionary* 
   model->error_reporter();
   LOG(INFO) << "resolved reporter";
   
-  key = [_registrar lookupKeyForAsset:args[@"labels"]];
-  NSString* labels_path = [[NSBundle mainBundle] pathForResource:key ofType:nil];
-  LoadLabels(labels_path, &labels);
+  if ([args[@"labels"] length] > 0) {
+    key = [_registrar lookupKeyForAsset:args[@"labels"]];
+    NSString* labels_path = [[NSBundle mainBundle] pathForResource:key ofType:nil];
+    LoadLabels(labels_path, &labels);
+  }
   
   tflite::ops::builtin::BuiltinOpResolver resolver;
   tflite::InterpreterBuilder(*model, resolver)(&interpreter);
@@ -127,6 +161,75 @@ NSString* loadModel(NSObject<FlutterPluginRegistrar>* _registrar, NSDictionary* 
     interpreter->SetNumThreads(num_threads);
   }
   return @"success";
+}
+
+void runTflite(NSDictionary* args, TfLiteStatusCallback cb) {
+  const bool asynch = [args[@"asynch"] boolValue];
+  if (asynch) {
+    interpreter_busy = true;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(void){
+      TfLiteStatus status = interpreter->Invoke();
+      dispatch_async(dispatch_get_main_queue(), ^(void){
+        interpreter_busy = false;
+        cb(status);
+      });
+    });
+  } else {
+    TfLiteStatus status = interpreter->Invoke();
+    cb(status);
+  }
+}
+
+NSMutableData *feedOutputTensor(int outputChannelsIn, float mean, float std, bool convertToUint8,
+                                int *widthOut, int *heightOut) {
+  assert(interpreter->outputs().size() == 1);
+  int output = interpreter->outputs()[0];
+  TfLiteTensor* output_tensor = interpreter->tensor(output);
+  const int width = output_tensor->dims->data[2];
+  const int channels = output_tensor->dims->data[3];
+  const int outputChannels = outputChannelsIn ? outputChannelsIn : channels;
+  assert(outputChannels >= channels);
+  if (widthOut) *widthOut = width;
+  if (heightOut) *heightOut = width;
+
+  NSMutableData *data = nil;
+  if (output_tensor->type == kTfLiteUInt8) {
+    int size = width*width*outputChannels;
+    data = [[NSMutableData dataWithCapacity: size] initWithLength: size];
+    uint8_t* out = (uint8_t*)[data bytes], *outEnd = out + width*width*outputChannels;
+    const uint8_t* bytes = interpreter->typed_tensor<uint8_t>(output);
+    while (out != outEnd) {
+      for (int c = 0; c < channels; c++)
+        *out++ = *bytes++;
+      for (int c = 0; c < outputChannels - channels; c++)
+        *out++ = 255;
+    }
+  } else { // kTfLiteFloat32
+    if (convertToUint8) {
+      int size = width*width*outputChannels;
+      data = [[NSMutableData dataWithCapacity: size] initWithLength: size];
+      uint8_t* out = (uint8_t*)[data bytes], *outEnd = out + width*width*outputChannels;
+      const float* bytes = interpreter->typed_tensor<float>(output);
+      while (out != outEnd) {
+        for (int c = 0; c < channels; c++)
+          *out++ = (*bytes++ * std) + mean;
+        for (int c = 0; c < outputChannels - channels; c++)
+          *out++ = 255;
+      }
+    } else { // kTfLiteFloat32
+      int size = width*width*outputChannels*4;
+      data = [[NSMutableData dataWithCapacity: size] initWithLength: size];
+      float* out = (float*)[data bytes], *outEnd = out + width*width*outputChannels;
+      const float* bytes = interpreter->typed_tensor<float>(output);
+      while (out != outEnd) {
+        for (int c = 0; c < channels; c++)
+          *out++ = (*bytes++ * std) + mean;
+        for (int c = 0; c < outputChannels - channels; c++)
+          *out++ = 255;
+      }
+    }
+  }
+  return data;
 }
 
 void feedInputTensorBinary(const FlutterStandardTypedData* typedData, int* input_size) {
@@ -250,67 +353,70 @@ NSMutableArray* GetTopN(const float* prediction, const unsigned long prediction_
   return predictions;
 }
 
-NSMutableArray* runModelOnImage(NSDictionary* args) {
+void runModelOnImage(NSDictionary* args, FlutterResult result) {
   const NSString* image_path = args[@"path"];
   const float input_mean = [args[@"imageMean"] floatValue];
   const float input_std = [args[@"imageStd"] floatValue];
   
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
   
   int input_size;
   feedInputTensorImage(image_path, input_mean, input_std, &input_size);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
-  }
-  
-  float* output = interpreter->typed_output_tensor<float>(0);
-  
-  if (output == NULL)
-    return empty;
-  
-  const unsigned long output_size = labels.size();
-  const int num_results = [args[@"numResults"] intValue];
-  const float threshold = [args[@"threshold"] floatValue];
-  return GetTopN(output, output_size, num_results, threshold);
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    float* output = interpreter->typed_output_tensor<float>(0);
+
+    if (output == NULL)
+      return result(empty);
+
+    const unsigned long output_size = labels.size();
+    const int num_results = [args[@"numResults"] intValue];
+    const float threshold = [args[@"threshold"] floatValue];
+    return result(GetTopN(output, output_size, num_results, threshold));
+  });
 }
 
-NSMutableArray* runModelOnBinary(NSDictionary* args) {
+void runModelOnBinary(NSDictionary* args, FlutterResult result) {
   const FlutterStandardTypedData* typedData = args[@"binary"];
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
 
   int input_size;
   feedInputTensorBinary(typedData, &input_size);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
-  }
-  
-  float* output = interpreter->typed_output_tensor<float>(0);
-  
-  if (output == NULL)
-    return empty;
-  
-  const unsigned long output_size = labels.size();
-  const int num_results = [args[@"numResults"] intValue];
-  const float threshold = [args[@"threshold"] floatValue];
-  return GetTopN(output, output_size, num_results, threshold);
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    float* output = interpreter->typed_output_tensor<float>(0);
+
+    if (output == NULL)
+      return result(empty);
+
+    const unsigned long output_size = labels.size();
+    const int num_results = [args[@"numResults"] intValue];
+    const float threshold = [args[@"threshold"] floatValue];
+    return result(GetTopN(output, output_size, num_results, threshold));
+  });
 }
 
-
-NSMutableArray* runModelOnFrame(NSDictionary* args) {
+void runModelOnFrame(NSDictionary* args, FlutterResult result) {
   const FlutterStandardTypedData* typedData = args[@"bytesList"][0];
   const int image_height = [args[@"imageHeight"] intValue];
   const int image_width = [args[@"imageWidth"] intValue];
@@ -318,29 +424,31 @@ NSMutableArray* runModelOnFrame(NSDictionary* args) {
   const float input_std = [args[@"imageStd"] floatValue];
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
   
   int input_size;
   int image_channels = 4;
   feedInputTensorFrame(typedData, &input_size, image_height, image_width, image_channels, input_mean, input_std);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
-  }
-  
-  float* output = interpreter->typed_output_tensor<float>(0);
-  
-  if (output == NULL)
-    return empty;
-  
-  const unsigned long output_size = labels.size();
-  const int num_results = [args[@"numResults"] intValue];
-  const float threshold = [args[@"threshold"] floatValue];
-  return GetTopN(output, output_size, num_results, threshold);
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    float* output = interpreter->typed_output_tensor<float>(0);
+
+    if (output == NULL)
+      return result(empty);
+
+    const unsigned long output_size = labels.size();
+    const int num_results = [args[@"numResults"] intValue];
+    const float threshold = [args[@"threshold"] floatValue];
+    return result(GetTopN(output, output_size, num_results, threshold));
+  });
 }
 
 NSMutableArray* parseSSDMobileNet(float threshold, int num_results_per_class) {
@@ -363,6 +471,7 @@ NSMutableArray* parseSSDMobileNet(float threshold, int num_results_per_class) {
     NSMutableDictionary* res = [NSMutableDictionary dictionary];
     NSString* class_name = [NSString stringWithUTF8String:labels[detected_class + 1].c_str()];
     NSObject* counter = [counters objectForKey:class_name];
+    
     if (counter) {
       int countValue = [(NSNumber*)counter intValue] + 1;
       if (countValue > num_results_per_class) {
@@ -498,7 +607,7 @@ NSMutableArray* parseYOLO(int num_classes, const NSArray* anchors, int block_siz
   return results;
 }
 
-NSMutableArray* detectObjectOnImage(NSDictionary* args) {
+void detectObjectOnImage(NSDictionary* args, FlutterResult result) {
   const NSString* image_path = args[@"path"];
   const NSString* model = args[@"model"];
   const float threshold = [args[@"threshold"] floatValue];
@@ -512,27 +621,29 @@ NSMutableArray* detectObjectOnImage(NSDictionary* args) {
   
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
   
   int input_size;
   feedInputTensorImage(image_path, input_mean, input_std, &input_size);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
-  }
-  
-  if ([model isEqual: @"SSDMobileNet"])
-    return parseSSDMobileNet(threshold, num_results_per_class);
-  else
-    return parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
-                     threshold, input_size);
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    if ([model isEqual: @"SSDMobileNet"])
+      return result(parseSSDMobileNet(threshold, num_results_per_class));
+    else
+      return result(parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
+                              threshold, input_size));
+  });
 }
 
-NSMutableArray* detectObjectOnBinary(NSDictionary* args) {
+void detectObjectOnBinary(NSDictionary* args, FlutterResult result) {
   const FlutterStandardTypedData* typedData = args[@"binary"];
   const NSString* model = args[@"model"];
   const float threshold = [args[@"threshold"] floatValue];
@@ -544,27 +655,29 @@ NSMutableArray* detectObjectOnBinary(NSDictionary* args) {
   
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
   
   int input_size;
   feedInputTensorBinary(typedData, &input_size);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
-  }
-  
-  if ([model isEqual: @"SSDMobileNet"])
-    return parseSSDMobileNet(threshold, num_results_per_class);
-  else
-    return parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
-                     threshold, input_size);
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    if ([model isEqual: @"SSDMobileNet"])
+      return result(parseSSDMobileNet(threshold, num_results_per_class));
+    else
+      return result(parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
+                              threshold, input_size));
+  });
 }
 
-NSMutableArray* detectObjectOnFrame(NSDictionary* args) {
+void detectObjectOnFrame(NSDictionary* args, FlutterResult result) {
   const FlutterStandardTypedData* typedData = args[@"bytesList"][0];
   const NSString* model = args[@"model"];
   const int image_height = [args[@"imageHeight"] intValue];
@@ -580,25 +693,646 @@ NSMutableArray* detectObjectOnFrame(NSDictionary* args) {
   
   NSMutableArray* empty = [@[] mutableCopy];
   
-  if (!interpreter) {
-    NSLog(@"Failed to construct interpreter.");
-    return empty;
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
   }
   
   int input_size;
   int image_channels = 4;
   feedInputTensorFrame(typedData, &input_size, image_height, image_width, image_channels, input_mean, input_std);
   
-  if (interpreter->Invoke() != kTfLiteOk) {
-    NSLog(@"Failed to invoke!");
-    return empty;
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    if ([model isEqual: @"SSDMobileNet"])
+      return result(parseSSDMobileNet(threshold, num_results_per_class));
+    else
+      return result(parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
+                              threshold, input_size));
+  });
+}
+
+void runPix2PixOnImage(NSDictionary* args, FlutterResult result) {
+  const NSString* image_path = args[@"path"];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const NSString* outputType = args[@"outputType"];
+  NSMutableArray* empty = [@[] mutableCopy];
+
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+
+  int input_size;
+  feedInputTensorImage(image_path, input_mean, input_std, &input_size);
+
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    int width = 0, height = 0;
+    NSMutableData* output = feedOutputTensor(4, input_mean, input_std, true, &width, &height);
+    if (output == NULL)
+      return result(empty);
+
+    if ([outputType isEqual: @"png"]) {
+      return result(CompressImage(output, width, height, 1));
+    } else {
+      return result(output);
+    }
+  });
+}
+
+void runPix2PixOnBinary(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"binary"];
+  NSMutableArray* empty = [@[] mutableCopy];
+
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+
+  int input_size;
+  feedInputTensorBinary(typedData, &input_size);
+
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    int width = 0, height = 0;
+    NSMutableData* output = feedOutputTensor(0, 0, 1, false, &width, &height);
+    if (output == NULL)
+      return result(empty);
+
+    return result(output);
+  });
+}
+
+void runPix2PixOnFrame(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"bytesList"][0];
+  const int image_height = [args[@"imageHeight"] intValue];
+  const int image_width = [args[@"imageWidth"] intValue];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const NSString* outputType = args[@"outputType"];
+  NSMutableArray* empty = [@[] mutableCopy];
+
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+
+  int input_size;
+  int image_channels = 4;
+  feedInputTensorFrame(typedData, &input_size, image_height, image_width, image_channels, input_mean, input_std);
+
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    int width = 0, height = 0;
+    NSMutableData* output = feedOutputTensor(image_channels, input_mean, input_std, true, &width, &height);
+    if (output == NULL)
+      return result(empty);
+
+    if ([outputType isEqual: @"png"]) {
+      return result(CompressImage(output, width, height, 1));
+    } else {
+      return result(output);
+    }
+  });
+}
+
+void setPixel(char* rgba, int index, long color) {
+  rgba[index * 4] = (color >> 16) & 0xFF;
+  rgba[index * 4 + 1] = (color >> 8) & 0xFF;
+  rgba[index * 4 + 2] = color & 0xFF;
+  rgba[index * 4 + 3] = (color >> 24) & 0xFF;
+}
+
+NSData* fetchArgmax(const NSArray* labelColors, const NSString* outputType) {
+  int output = interpreter->outputs()[0];
+  TfLiteTensor* output_tensor = interpreter->tensor(output);
+  const int height = output_tensor->dims->data[1];
+  const int width = output_tensor->dims->data[2];
+  const int channels = output_tensor->dims->data[3];
+  
+  NSMutableData *data = nil;
+  int size = height * width * 4;
+  data = [[NSMutableData dataWithCapacity: size] initWithLength: size];
+  char* out = (char*)[data bytes];
+  if (output_tensor->type == kTfLiteUInt8) {
+    const uint8_t* bytes = interpreter->typed_tensor<uint8_t>(output);
+    for (int i = 0; i < height; ++i) {
+      for (int j = 0; j < width; ++j) {
+        int index = i * width + j;
+        int maxIndex = 0;
+        int maxValue = 0;
+        for (int c = 0; c < channels; ++c) {
+          int outputValue = bytes[index* channels + c];
+          if (outputValue > maxValue) {
+            maxIndex = c;
+            maxValue = outputValue;
+          }
+        }
+        long labelColor = [[labelColors objectAtIndex:maxIndex] longValue];
+        setPixel(out, index, labelColor);
+      }
+    }
+  } else { // kTfLiteFloat32
+    const float* bytes = interpreter->typed_tensor<float>(output);
+    for (int i = 0; i < height; ++i) {
+      for (int j = 0; j < width; ++j) {
+        int index = i * width + j;
+        int maxIndex = 0;
+        float maxValue = .0f;
+        for (int c = 0; c < channels; ++c) {
+          float outputValue = bytes[index * channels + c];
+          if (outputValue > maxValue) {
+            maxIndex = c;
+            maxValue = outputValue;
+          }
+        }
+        long labelColor = [[labelColors objectAtIndex:maxIndex] longValue];
+        setPixel(out, index, labelColor);
+      }
+    }
   }
   
-  if ([model isEqual: @"SSDMobileNet"])
-    return parseSSDMobileNet(threshold, num_results_per_class);
-  else
-    return parseYOLO((int)(labels.size() - 1), anchors, block_size, num_boxes_per_block, num_results_per_class,
-                     threshold, input_size);
+  if ([outputType isEqual: @"png"]) {
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bitmapContext = CGBitmapContextCreate(out,
+                                                       width,
+                                                       height,
+                                                       8, // bitsPerComponent
+                                                       4 * width, // bytesPerRow
+                                                       colorSpace,
+                                                       kCGImageAlphaNoneSkipLast);
+    
+    CFRelease(colorSpace);
+    CGImageRef cgImage = CGBitmapContextCreateImage(bitmapContext);
+    NSData* image = UIImagePNGRepresentation([[UIImage alloc] initWithCGImage:cgImage]);
+    CFRelease(cgImage);
+    CFRelease(bitmapContext);
+    return image;
+  } else {
+    return data;
+  }
+}
+
+void runSegmentationOnImage(NSDictionary* args, FlutterResult result) {
+  const NSString* image_path = args[@"path"];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const NSArray* labelColors = args[@"labelColors"];
+  const NSString* outputType = args[@"outputType"];
+  NSMutableArray* empty = [@[] mutableCopy];
+  
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  feedInputTensorImage(image_path, input_mean, input_std, &input_size);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    NSData* output = fetchArgmax(labelColors, outputType);
+    FlutterStandardTypedData* ret = [FlutterStandardTypedData typedDataWithBytes: output];
+    return result(ret);
+  });
+}
+
+void runSegmentationOnBinary(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"binary"];
+  const NSArray* labelColors = args[@"labelColors"];
+  const NSString* outputType = args[@"outputType"];
+  NSMutableArray* empty = [@[] mutableCopy];
+  
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  feedInputTensorBinary(typedData, &input_size);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    NSData* output = fetchArgmax(labelColors, outputType);
+    FlutterStandardTypedData* ret = [FlutterStandardTypedData typedDataWithBytes: output];
+    return result(ret);
+  });
+}
+
+void runSegmentationOnFrame(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"bytesList"][0];
+  const int image_height = [args[@"imageHeight"] intValue];
+  const int image_width = [args[@"imageWidth"] intValue];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const NSArray* labelColors = args[@"labelColors"];
+  const NSString* outputType = args[@"outputType"];
+  NSMutableArray* empty = [@[] mutableCopy];
+
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  int image_channels = 4;
+  feedInputTensorFrame(typedData, &input_size, image_height, image_width, image_channels, input_mean, input_std);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+
+    NSData* output = fetchArgmax(labelColors, outputType);
+    FlutterStandardTypedData* ret = [FlutterStandardTypedData typedDataWithBytes: output];
+    return result(ret);
+  });
+}
+
+
+NSArray* part_names = @[
+  @"nose", @"leftEye", @"rightEye", @"leftEar", @"rightEar", @"leftShoulder",
+  @"rightShoulder", @"leftElbow", @"rightElbow", @"leftWrist", @"rightWrist",
+  @"leftHip", @"rightHip", @"leftKnee", @"rightKnee", @"leftAnkle", @"rightAnkle"
+];
+
+NSArray* pose_chain = @[
+   @[@"nose", @"leftEye"], @[@"leftEye", @"leftEar"], @[@"nose", @"rightEye"],
+   @[@"rightEye", @"rightEar"], @[@"nose", @"leftShoulder"],
+   @[@"leftShoulder", @"leftElbow"], @[@"leftElbow", @"leftWrist"],
+   @[@"leftShoulder", @"leftHip"], @[@"leftHip", @"leftKnee"],
+   @[@"leftKnee", @"leftAnkle"], @[@"nose", @"rightShoulder"],
+   @[@"rightShoulder", @"rightElbow"], @[@"rightElbow", @"rightWrist"],
+   @[@"rightShoulder", @"rightHip"], @[@"rightHip", @"rightKnee"],
+   @[@"rightKnee", @"rightAnkle"]
+];
+
+NSMutableDictionary* parts_ids = [NSMutableDictionary dictionary];
+NSMutableArray* parent_to_child_edges = [NSMutableArray array];
+NSMutableArray* child_to_parent_edges = [NSMutableArray array];
+int local_maximum_radius = 1;
+int output_stride = 16;
+int height;
+int width;
+int num_keypoints;
+
+void initPoseNet() {
+  if ([parts_ids count] == 0) {
+    for (int i = 0; i < [part_names count]; ++i)
+      [parts_ids setValue:[NSNumber numberWithInt:i] forKey:part_names[i]];
+    
+    for (int i = 0; i < [pose_chain count]; ++i) {
+      [parent_to_child_edges addObject:parts_ids[pose_chain[i][1]]];
+      [child_to_parent_edges addObject:parts_ids[pose_chain[i][0]]];
+    }
+  }
+}
+
+bool scoreIsMaximumInLocalWindow(int keypoint_id,
+                                 float score,
+                                 int heatmap_y,
+                                 int heatmap_x,
+                                 int local_maximum_radius,
+                                 float* scores) {
+  bool local_maxium = true;
+  
+  int y_start = MAX(heatmap_y - local_maximum_radius, 0);
+  int y_end = MIN(heatmap_y + local_maximum_radius + 1, height);
+  for (int y_current = y_start; y_current < y_end; ++y_current) {
+    int x_start = MAX(heatmap_x - local_maximum_radius, 0);
+    int x_end = MIN(heatmap_x + local_maximum_radius + 1, width);
+    for (int x_current = x_start; x_current < x_end; ++x_current) {
+      if (sigmoid(scores[(y_current * width + x_current) * num_keypoints + keypoint_id]) > score) {
+        local_maxium = false;
+        break;
+      }
+    }
+    if (!local_maxium) {
+      break;
+    }
+  }
+  return local_maxium;
+}
+
+typedef std::priority_queue<std::pair<float, NSMutableDictionary*>,
+std::vector<std::pair<float, NSMutableDictionary*>>,
+std::less<std::pair<float, NSMutableDictionary*>>> PriorityQueue;
+
+PriorityQueue buildPartWithScoreQueue(float* scores,
+                                      float threshold,
+                                      int local_maximum_radius) {
+  PriorityQueue pq;
+  for (int heatmap_y = 0; heatmap_y < height; ++heatmap_y) {
+    for (int heatmap_x = 0; heatmap_x < width; ++heatmap_x) {
+      for (int keypoint_id = 0; keypoint_id < num_keypoints; ++keypoint_id) {
+        float score = sigmoid(scores[(heatmap_y * width + heatmap_x) *
+                                     num_keypoints + keypoint_id]);
+        if (score < threshold) continue;
+        
+        if (scoreIsMaximumInLocalWindow(keypoint_id, score, heatmap_y, heatmap_x,
+                                        local_maximum_radius, scores)) {
+          NSMutableDictionary* res = [NSMutableDictionary dictionary];
+          [res setValue:[NSNumber numberWithFloat:score] forKey:@"score"];
+          [res setValue:[NSNumber numberWithInt:heatmap_y] forKey:@"y"];
+          [res setValue:[NSNumber numberWithInt:heatmap_x] forKey:@"x"];
+          [res setValue:[NSNumber numberWithInt:keypoint_id] forKey:@"partId"];
+          pq.push(std::pair<float, NSMutableDictionary*>(score, res));
+        }
+      }
+    }
+  }
+  return pq;
+}
+
+void getImageCoords(float* res,
+                    NSMutableDictionary* keypoint,
+                    float* offsets) {
+  int heatmap_y = [keypoint[@"y"] intValue];
+  int heatmap_x = [keypoint[@"x"] intValue];
+  int keypoint_id = [keypoint[@"partId"] intValue];
+  
+  int offset = (heatmap_y * width + heatmap_x) * num_keypoints * 2 + keypoint_id;
+  float offset_y = offsets[offset];
+  float offset_x = offsets[offset + num_keypoints];
+  res[0] = heatmap_y * output_stride + offset_y;
+  res[1] = heatmap_x * output_stride + offset_x;
+}
+
+
+bool withinNmsRadiusOfCorrespondingPoint(NSMutableArray* poses,
+                                         float squared_nms_radius,
+                                         float y,
+                                         float x,
+                                         int keypoint_id,
+                                         int input_size) {
+  for (NSMutableDictionary* pose in poses) {
+    NSMutableDictionary* keypoints = pose[@"keypoints"];
+    NSMutableDictionary* correspondingKeypoint = keypoints[[NSNumber numberWithInt:keypoint_id]];
+    float _x = [correspondingKeypoint[@"x"] floatValue] * input_size - x;
+    float _y = [correspondingKeypoint[@"y"] floatValue] * input_size - y;
+    float squaredDistance = _x * _x + _y * _y;
+    if (squaredDistance <= squared_nms_radius)
+      return true;
+  }
+  return false;
+}
+
+void getStridedIndexNearPoint(int* res, float _y, float _x) {
+  int y_ = round(_y / output_stride);
+  int x_ = round(_x / output_stride);
+  int y = y_ < 0 ? 0 : y_ > height - 1 ? height - 1 : y_;
+  int x = x_ < 0 ? 0 : x_ > width - 1 ? width - 1 : x_;
+  res[0] = y;
+  res[1] = x;
+}
+
+void getDisplacement(float* res, int edgeId, int* keypoint, float* displacements) {
+  int num_edges = (int)[parent_to_child_edges count];
+  int y = keypoint[0];
+  int x = keypoint[1];
+  int offset = (y * width + x) * num_edges * 2 + edgeId;
+  res[0] = displacements[offset];
+  res[1] = displacements[offset + num_edges];
+}
+
+float getInstanceScore(NSMutableDictionary* keypoints) {
+  float scores = 0;
+  for (NSMutableDictionary* keypoint in keypoints.allValues)
+    scores += [keypoint[@"score"] floatValue];
+  return scores / num_keypoints;
+}
+
+NSMutableDictionary* traverseToTargetKeypoint(int edge_id,
+                                              NSMutableDictionary* source_keypoint,
+                                              int target_keypoint_id,
+                                              float* scores,
+                                              float* offsets,
+                                              float* displacements,
+                                              int input_size) {
+  float source_keypoint_y = [source_keypoint[@"y"] floatValue] * input_size;
+  float source_keypoint_x = [source_keypoint[@"x"] floatValue] * input_size;
+  
+  int source_keypoint_indices[2];
+  getStridedIndexNearPoint(source_keypoint_indices, source_keypoint_y, source_keypoint_x);
+  
+  float displacement[2];
+  getDisplacement(displacement, edge_id, source_keypoint_indices, displacements);
+  
+  float displaced_point[2];
+  displaced_point[0] = source_keypoint_y + displacement[0];
+  displaced_point[1] = source_keypoint_x + displacement[1];
+  
+  float* target_keypoint = displaced_point;
+  
+  int offset_refine_step = 2;
+  for (int i = 0; i < offset_refine_step; i++) {
+    int target_keypoint_indices[2];
+    getStridedIndexNearPoint(target_keypoint_indices, target_keypoint[0], target_keypoint[1]);
+    
+    int target_keypoint_y = target_keypoint_indices[0];
+    int target_keypoint_x = target_keypoint_indices[1];
+    
+    int offset = (target_keypoint_y * width + target_keypoint_x) * num_keypoints * 2 + target_keypoint_id;
+    float offset_y = offsets[offset];
+    float offset_x = offsets[offset + num_keypoints];
+    
+    target_keypoint[0] = target_keypoint_y * output_stride + offset_y;
+    target_keypoint[1] = target_keypoint_x * output_stride + offset_x;
+  }
+  
+  int target_keypoint_indices[2];
+  getStridedIndexNearPoint(target_keypoint_indices, target_keypoint[0], target_keypoint[1]);
+  
+  float score = sigmoid(scores[(target_keypoint_indices[0] * width +
+                                target_keypoint_indices[1]) * num_keypoints + target_keypoint_id]);
+  
+  NSMutableDictionary* keypoint = [NSMutableDictionary dictionary];
+  [keypoint setValue:[NSNumber numberWithFloat:score] forKey:@"score"];
+  [keypoint setValue:[NSNumber numberWithFloat:target_keypoint[0] / input_size] forKey:@"y"];
+  [keypoint setValue:[NSNumber numberWithFloat:target_keypoint[1] / input_size] forKey:@"x"];
+  [keypoint setValue:part_names[target_keypoint_id] forKey:@"part"];
+  return keypoint;
+}
+
+NSMutableArray* parsePoseNet(int num_results, float threshold, int nms_radius, int input_size) {
+  initPoseNet();
+  
+  assert(interpreter->outputs().size() == 4);
+  TfLiteTensor* scores_tensor = interpreter->tensor(interpreter->outputs()[0]);
+  height = scores_tensor->dims->data[1];
+  width = scores_tensor->dims->data[2];
+  num_keypoints = scores_tensor->dims->data[3];
+  
+  float* scores = interpreter->typed_output_tensor<float>(0);
+  float* offsets = interpreter->typed_output_tensor<float>(1);
+  float* displacements_fwd = interpreter->typed_output_tensor<float>(2);
+  float* displacements_bwd = interpreter->typed_output_tensor<float>(3);
+  
+  PriorityQueue pq = buildPartWithScoreQueue(scores, threshold, local_maximum_radius);
+  
+  int num_edges = (int)[parent_to_child_edges count];
+  int sqared_nms_radius = nms_radius * nms_radius;
+  
+  NSMutableArray* results = [NSMutableArray array];
+  
+  while([results count] < num_results && !pq.empty()) {
+    NSMutableDictionary* root = pq.top().second;
+    pq.pop();
+    
+    float root_point[2];
+    getImageCoords(root_point, root, offsets);
+    
+    if (withinNmsRadiusOfCorrespondingPoint(results, sqared_nms_radius, root_point[0], root_point[1],
+                                            [root[@"partId"] intValue], input_size))
+      continue;
+    
+    NSMutableDictionary* keypoint = [NSMutableDictionary dictionary];
+    [keypoint setValue:[NSNumber numberWithFloat:[root[@"score"] floatValue]] forKey:@"score"];
+    [keypoint setValue:[NSNumber numberWithFloat:root_point[0] / input_size] forKey:@"y"];
+    [keypoint setValue:[NSNumber numberWithFloat:root_point[1] / input_size] forKey:@"x"];
+    [keypoint setValue:part_names[[root[@"partId"] intValue]] forKey:@"part"];
+    
+    NSMutableDictionary* keypoints = [NSMutableDictionary dictionary];
+    [keypoints setObject:keypoint forKey:root[@"partId"]];
+    
+    for (int edge = num_edges - 1; edge >= 0; --edge) {
+      int source_keypoint_id = [parent_to_child_edges[edge] intValue];
+      int target_keypoint_id = [child_to_parent_edges[edge] intValue];
+      if (keypoints[[NSNumber numberWithInt:source_keypoint_id]] &&
+          !(keypoints[[NSNumber numberWithInt:target_keypoint_id]])) {
+        keypoint = traverseToTargetKeypoint(edge, keypoints[[NSNumber numberWithInt:source_keypoint_id]],
+                                            target_keypoint_id, scores, offsets, displacements_bwd, input_size);
+        [keypoints setObject:keypoint forKey:[NSNumber numberWithInt:target_keypoint_id]];
+      }
+    }
+    
+    for (int edge = 0; edge < num_edges; ++edge) {
+      int source_keypoint_id = [child_to_parent_edges[edge] intValue];
+      int target_keypoint_id = [parent_to_child_edges[edge] intValue];
+      if (keypoints[[NSNumber numberWithInt:source_keypoint_id]] &&
+          !(keypoints[[NSNumber numberWithInt:target_keypoint_id]])) {
+        keypoint = traverseToTargetKeypoint(edge, keypoints[[NSNumber numberWithInt:source_keypoint_id]],
+                                            target_keypoint_id, scores, offsets, displacements_fwd, input_size);
+        [keypoints setObject:keypoint forKey:[NSNumber numberWithInt:target_keypoint_id]];
+      }
+    }
+    
+    NSMutableDictionary* result = [NSMutableDictionary dictionary];
+    [result setObject:keypoints forKey:@"keypoints"];
+    [result setValue:[NSNumber numberWithFloat:getInstanceScore(keypoints)] forKey:@"score"];
+    [results addObject:result];
+  }
+  
+  return results;
+}
+
+void runPoseNetOnImage(NSDictionary* args, FlutterResult result) {
+  const NSString* image_path = args[@"path"];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const int num_results = [args[@"numResults"] intValue];
+  const float threshold = [args[@"threshold"] floatValue];
+  const int nms_radius = [args[@"nmsRadius"] intValue];;
+  NSMutableArray* empty = [@[] mutableCopy];
+  
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  feedInputTensorImage(image_path, input_mean, input_std, &input_size);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+    
+    return result(parsePoseNet(num_results, threshold, nms_radius, input_size));
+  });
+}
+
+void runPoseNetOnBinary(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"binary"];
+  const int num_results = [args[@"numResults"] intValue];
+  const float threshold = [args[@"threshold"] floatValue];
+  const int nms_radius = [args[@"nmsRadius"] intValue];;
+  NSMutableArray* empty = [@[] mutableCopy];
+  
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  feedInputTensorBinary(typedData, &input_size);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+    
+    return result(parsePoseNet(num_results, threshold, nms_radius, input_size));
+  });
+}
+
+void runPoseNetOnFrame(NSDictionary* args, FlutterResult result) {
+  const FlutterStandardTypedData* typedData = args[@"bytesList"][0];
+  const int image_height = [args[@"imageHeight"] intValue];
+  const int image_width = [args[@"imageWidth"] intValue];
+  const float input_mean = [args[@"imageMean"] floatValue];
+  const float input_std = [args[@"imageStd"] floatValue];
+  const int num_results = [args[@"numResults"] intValue];
+  const float threshold = [args[@"threshold"] floatValue];
+  const int nms_radius = [args[@"nmsRadius"] intValue];;
+  NSMutableArray* empty = [@[] mutableCopy];
+  
+  if (!interpreter || interpreter_busy) {
+    NSLog(@"Failed to construct interpreter or busy.");
+    return result(empty);
+  }
+  
+  int input_size;
+  int image_channels = 4;
+  feedInputTensorFrame(typedData, &input_size, image_height, image_width, image_channels, input_mean, input_std);
+  
+  runTflite(args, ^(TfLiteStatus status) {
+    if (status != kTfLiteOk) {
+      NSLog(@"Failed to invoke!");
+      return result(empty);
+    }
+    
+    return result(parsePoseNet(num_results, threshold, nms_radius, input_size));
+  });
 }
 
 void close() {
